@@ -1,0 +1,372 @@
+Master context — save as PROJECT_CONTEXT.md in your repo root
+PROJECT: Mini-market e-commerce platform (rebuild from legacy PHP system)
+
+BUSINESS CONTEXT:
+- Grocery/mini-market ordering app. Customers order online, staff manually verify
+  physical stock before confirming (no live inventory feed exists).
+- Product catalog, pricing, and branch/shop data come ONLY from Microsoft Dynamics
+  NAV 2015 (SQL Server), accessed read-only via a 15-minute polling sync job.
+  We do NOT have a NAV developer license — no write-back to NAV is possible or
+  permitted, ever, under any circumstance.
+- Because stock data is only 15 minutes fresh at best, it can NEVER be used to
+  auto-approve an order. It is a hint shown to staff, not a source of truth.
+  Final availability confirmation is always a manual human action by a staff
+  member physically checking the shelf.
+- KEY FEATURE: if a customer orders multiple items and only some are in stock,
+  the system must notify the customer of exactly which items are available and
+  which aren't, and let them choose to proceed with the available subset or
+  cancel entirely — never auto-cancel the whole order over one missing item.
+
+NON-NEGOTIABLE RULES (do not violate these under any circumstances):
+1. No endpoint, anywhere, in any role, may create/update/delete catalog items,
+   prices, or branches. That data is synced from NAV read-only. If this
+   constraint seems inconvenient for a task, stop and ask instead of adding
+   a workaround endpoint.
+2. All SQL must be parameterized via the ORM. Never string-concatenate a query.
+3. Order and order-item status may only be changed by OrderStateMachineService.
+   No controller or other service sets .status directly.
+4. Every status change (order or item level) must write to an audit history
+   table: who changed it, from what value, to what value, when.
+5. Passwords: this app uses Google OAuth2 as the only login method. Do not
+   build a password login flow unless explicitly asked.
+6. Staff/admin accounts are allowlist-gated: a Google email must exist in a
+   staff_allowlist table BEFORE any staff account or session is created.
+   Customer accounts are open self-registration via Google OAuth2 — no allowlist.
+7. Every state-changing endpoint needs input validation via DTOs (class-validator),
+   auth guard, and role guard where applicable. No exceptions for "internal" or
+   "admin-only" routes — those still need the guards, just with different roles.
+
+TECH STACK:
+- Backend: NestJS (TypeScript), PostgreSQL, TypeORM, Socket.IO (WebSocket gateways)
+- Admin frontend: React + Vite + Tailwind CSS + TanStack Query
+- Customer mobile app: Flutter
+- Auth: Google OAuth2 + JWT access tokens (15 min) + rotating refresh tokens
+- NAV connection: mssql package, read-only SQL login, scheduled via @nestjs/schedule
+
+ORDER ITEM STATUS ENUM:
+PENDING_REVIEW, AVAILABLE, PARTIALLY_AVAILABLE, UNAVAILABLE, CUSTOMER_DECLINED, CONFIRMED
+
+ORDER STATUS ENUM:
+PENDING_REVIEW, UNDER_REVIEW, AWAITING_CUSTOMER_DECISION, CONFIRMED, PREPARING,
+READY, PICKED, DELIVERED, CANCELLED, EXPIRED
+
+CODING STANDARDS:
+- Write tests for services with business logic (state machine, sync, auth guards)
+  at minimum. Controllers can be lighter.
+- Small, reviewable commits. One logical change per commit.
+- If a requirement is ambiguous, ask a clarifying question rather than guessing
+  and moving on.
+- Do not introduce new npm packages without saying which one and why.
+
+Phase 1 — Foundation: scaffolding, auth, RBAC
+Read PROJECT_CONTEXT.md before starting. Follow all non-negotiable rules in it.
+
+Scaffold a new NestJS project for the backend described in PROJECT_CONTEXT.md.
+
+1. Project setup:
+   - NestJS with TypeScript, ESLint, Prettier
+   - TypeORM connected to PostgreSQL, config loaded via @nestjs/config with a
+     validated schema (Joi or Zod) — fail fast on missing env vars
+   - Global ValidationPipe with whitelist: true, forbidNonWhitelisted: true
+   - Global exception filter returning a consistent error JSON shape
+   - helmet(), CORS allowlist (from env var, comma-separated origins)
+
+2. Folder structure: use a modular structure — src/auth, src/users, src/staff,
+   src/rbac, src/common (guards/decorators/filters/pipes), src/config,
+   src/database/migrations. Ask me before deviating from this.
+
+3. auth module — TWO separate flows sharing one module:
+
+   Customer flow (open self-registration):
+   - GET /auth/google → redirect to Google OAuth consent
+   - GET /auth/google/callback → find or create user by Google email,
+     issue access token + refresh token (httpOnly cookie)
+   - POST /auth/refresh → validate refresh token, rotate it, detect reuse
+     (if a token is used twice, revoke the whole token family, force re-login)
+   - POST /auth/logout → revoke refresh token
+
+   Staff flow (allowlist-gated):
+   - GET /auth/staff/google, GET /auth/staff/google/callback
+   - On callback: check the Google email against staff_allowlist table
+     BEFORE creating any account or session. If not present, return 403
+     with a generic message — do not reveal whether the email exists elsewhere
+     in the system. If present, create/update the staff record and issue
+     tokens carrying a role claim.
+
+   Store only a SHA-256 hash of refresh tokens in the DB, never the raw token.
+
+4. rbac module:
+   - role, permission entities, staff_role join
+   - RolesGuard + @Roles(...) decorator, checked server-side on every
+     protected route, not just hidden in the frontend
+   - RbacService.checkPermission(staffId, resource, action)
+
+5. staff_allowlist entity: email, added_by, added_at, notes. Add a simple
+   seed script so I can add my own email to it locally for testing.
+
+6. Add rate limiting (@nestjs/throttler) specifically on the auth endpoints.
+
+Write unit tests for: refresh token rotation/reuse detection, staff allowlist
+rejection, RolesGuard behavior. Give me a short summary of what was built and
+how to run it locally when done — don't just say "done."
+
+Phase 2 — NAV sync + read-only catalog
+Read PROJECT_CONTEXT.md. Rule 1 (no catalog write endpoints) applies strictly
+to everything in this phase.
+
+Build the nav-sync and catalog modules.
+
+1. nav-sync module:
+   - Connect to SQL Server via the `mssql` package using a read-only
+     connection string from env vars
+   - Pull from these NAV views: view_item, view_sales_price,
+     view_price_discount, view_brand, view_product_group, view_item_catagory
+     (I'll give you the actual column names/sample rows before you write
+     the query mapping — don't guess column names)
+   - Upsert into Postgres catalog tables (items, brands, product_groups,
+     categories, item_prices) — see schema below
+   - Also sync current stock quantities per branch into item_stock_snapshot
+     (nav_item_no, branch_id, qty, synced_at) — this is a HINT table only,
+     label it clearly as such in code comments
+   - Run on a schedule via @nestjs/schedule, every 15 minutes
+   - Every run writes a row to nav_sync_log: started_at, finished_at,
+     rows_synced, status (success/failed), error_message if failed
+   - If a sync run fails, log it clearly and do NOT wipe existing cached
+     data — keep serving the last good sync until the next successful one
+
+2. catalog module — READ ONLY, no exceptions:
+   - GET /catalog/categories, /catalog/categories/:id/groups,
+     /catalog/items, /catalog/items/:id, /catalog/search?q=
+   - Search should use Postgres pg_trgm trigram index on item title, not
+     a LIKE '%x%' scan — set up the extension and index in a migration
+   - Every response should include a note of when that item's data was
+     last synced (synced_at), so the frontend can show staleness
+
+3. Schema (create as TypeORM entities + migration):
+   items(nav_item_no PK, title_en, title_am, brand_id, group_id, uom,
+     image_url, synced_at)
+   item_prices(nav_item_no, branch_id, price, discount_pct, valid_from,
+     valid_to, synced_at)
+   item_stock_snapshot(nav_item_no, branch_id, qty, synced_at,
+     PRIMARY KEY(nav_item_no, branch_id))
+   categories, product_groups, brands — standard hierarchy tables
+
+Use mock/sample NAV view data for local dev and tests since we don't have
+a dev NAV license — I'll point you to a real (but restricted) connection
+for staging later. Ask me before assuming any specific column names.
+
+Phase 3 — Cart + order creation
+Read PROJECT_CONTEXT.md.
+
+Build cart and orders modules — creation only, no review/approval logic yet
+(that's Phase 4, don't build ahead of it).
+
+1. cart module:
+   - cart_items table: customer_id, nav_item_no, qty, added_at
+   - POST /cart/items, PATCH /cart/items/:id, DELETE /cart/items/:id,
+     GET /cart
+   - Validate quantity against a sane max (configurable), not against
+     stock (we don't trust stock data at this layer)
+   - Prices are always looked up fresh from item_prices at read time,
+     never cached in the cart row itself
+
+2. orders module (creation path only):
+   - orders table: id, order_number (human readable, e.g. ORD-20260709-0042,
+     not a raw timestamp), customer_id, status (default PENDING_REVIEW),
+     delivery_type, branch_id, payment_method, payment_status, subtotal,
+     total, decision_deadline (nullable), reviewed_by (nullable),
+     created_at, updated_at
+   - order_items table: id, order_id, nav_item_no, item_name_snap (snapshot
+     at order time — survives later NAV renames), qty_requested,
+     qty_available (nullable), unit_price_snap, line_status (default
+     PENDING_REVIEW), reviewed_at
+   - order_status_history table: order_id, order_item_id (nullable — null
+     means order-level change), old_status, new_status, changed_by
+     (nullable — null means system/automatic), note, created_at
+   - POST /orders — creates order from current cart, snapshots prices and
+     item names into order_items, clears the cart, sets order status
+     PENDING_REVIEW and every order_item PENDING_REVIEW
+   - GET /orders (customer's own orders), GET /orders/:id
+   - Every order/item creation writes an initial row to
+     order_status_history
+
+Indexes to add in the migration:
+   idx_orders_status_created ON orders(status, created_at DESC)
+   idx_orders_customer ON orders(customer_id, created_at DESC)
+   idx_order_items_order ON order_items(order_id)
+   idx_order_items_pending ON order_items(order_id) WHERE line_status = 'PENDING_REVIEW'
+
+Do not build any status-transition logic yet beyond the initial creation —
+that's the entire scope of Phase 4, keep this phase to creation only.
+
+Phase 4 — Order state machine + shortage decision flow (headline feature)
+Read PROJECT_CONTEXT.md. This is the most important phase — take your time
+and confirm the state model with me before writing code if anything is unclear.
+
+Build OrderStateMachineService — the ONLY place order/order_item status can
+change (rule 3 in PROJECT_CONTEXT.md).
+
+1. Staff review endpoints (role-gated, staff/admin only):
+   - GET /admin/orders/queue — orders with status PENDING_REVIEW or
+     UNDER_REVIEW, sorted oldest first
+   - PATCH /admin/orders/:orderId/items/:itemId/review — body:
+     { qtyAvailable: number, decision: 'AVAILABLE' | 'PARTIALLY_AVAILABLE' | 'UNAVAILABLE' }
+     - validates decision matches qtyAvailable vs qtyRequested
+     - sets line_status, reviewed_at, writes to order_status_history
+     - sets order.status to UNDER_REVIEW if this is the first item reviewed
+     - when this was the LAST unreviewed item on the order, trigger the
+       completion check below in the same transaction
+
+2. Completion check (runs after every item review, when no PENDING_REVIEW
+   items remain on the order):
+   - all items AVAILABLE → order.status = CONFIRMED, notify customer
+     "order confirmed", write history row
+   - all items UNAVAILABLE → order.status = CANCELLED, notify customer
+     with reason, write history row
+   - mixed result → order.status = AWAITING_CUSTOMER_DECISION,
+     order.decision_deadline = now + 6 hours (configurable via env),
+     notify customer with the available/unavailable breakdown and totals
+     for both scenarios, write history row
+
+3. Customer decision endpoint:
+   - POST /orders/:id/decision — body: { decision: 'PROCEED' | 'CANCEL' }
+   - only valid when order.status = AWAITING_CUSTOMER_DECISION and
+     customer owns the order
+   - PROCEED: unavailable/partially-declined items → CUSTOMER_DECLINED,
+     available items → CONFIRMED, recalculate order.total from confirmed
+     items only, order.status = CONFIRMED
+   - CANCEL: order.status = CANCELLED
+   - write history row either way
+
+4. Expiry job:
+   - @Cron job, runs every 5 minutes, finds orders where
+     status = AWAITING_CUSTOMER_DECISION AND decision_deadline < now()
+     (use the partial index from Phase 3), sets status = EXPIRED,
+     notifies customer, writes history row
+
+5. Continue lifecycle for CONFIRMED orders (mirrors the legacy system's
+   flow but through the state machine service):
+   PREPARING → READY → PICKED (pickup) / delivered via driver → DELIVERED
+   - PATCH /admin/orders/:id/status endpoint for staff to advance through
+     these, role-gated, validates only legal transitions are allowed
+     (e.g. can't go from PREPARING straight to DELIVERED)
+
+Write thorough unit tests for OrderStateMachineService covering: all-available
+path, all-unavailable path, mixed path, customer proceed, customer cancel,
+expiry, and rejection of illegal transitions. This service is the core of
+the whole app — do not skip test coverage here even if you're tight on time
+elsewhere.
+
+Phase 5 — Notifications + WebSocket
+Read PROJECT_CONTEXT.md.
+
+Build the notifications module and WebSocket gateways described below,
+and wire them into every notify-the-customer/notify-staff point created
+in Phase 4 (replace any placeholder logging with real calls).
+
+1. notifications table: id, customer_id (nullable, null = staff-targeted),
+   staff_id (nullable), type, title, body, data (jsonb, e.g. order id),
+   read_at (nullable), created_at
+
+2. Two WebSocket namespaces:
+   - /ws/customer — JWT required in handshake auth, joins room
+     `customer:{userId}`. Events: order.statusChanged, order.decisionRequired
+   - /ws/staff — JWT + role required in handshake, joins room
+     `staff:orders-queue`. Events: order.newForReview, order.reviewedByOther
+     (so two staff don't work the same order simultaneously)
+
+3. NotificationsService.notify(...) should:
+   - always write a row to the notifications table first (source of truth)
+   - then push over WebSocket to the relevant room if connected
+   - the DB write must never be skipped even if the WebSocket push fails
+
+4. Use the Redis adapter for Socket.IO (@socket.io/redis-adapter) from the
+   start, even though we're running a single instance — set it up now.
+
+5. GET /notifications (customer's own, paginated), PATCH
+   /notifications/:id/read
+
+Index: notifications(customer_id, read_at) for the unread-count query.
+
+Add a note in the README about how to test the WebSocket flow locally
+(e.g. a simple test client or curl-based trigger).
+
+Phase 6 — Payments
+Read PROJECT_CONTEXT.md.
+
+Build the payments module. Design a PaymentProvider interface first, then
+implement providers behind it — don't hardcode gateway-specific logic into
+the orders module.
+
+1. Interface: PaymentProvider { initiate(order), handleCallback(payload) }
+
+2. Providers to implement, one file each, isolated:
+   - CashProvider — trivial, payment_status stays 'unpaid' until delivery,
+     no external calls
+   - BankTransferProvider — customer submits payer name + transaction ref,
+     staff manually confirms via an admin endpoint
+   - Whatever online gateway we're integrating (I'll give you API docs
+     when we get here — don't invent an integration, ask first)
+
+3. For any provider with a webhook/callback: verify the signature
+   server-side before trusting the payload, every time, no exceptions —
+   this was a specific weakness in the legacy system I want fixed here.
+
+4. payment_status enum on orders: unpaid, pending_confirmation, paid, failed
+
+Wire payment confirmation into the order lifecycle appropriately — ask me
+if it's unclear whether a given payment method should block order
+confirmation or just run in parallel with the stock-review flow.
+
+Phase 7 — React admin dashboard
+Read PROJECT_CONTEXT.md.
+
+Scaffold the admin frontend: React + Vite + TypeScript + Tailwind CSS +
+TanStack Query for all server state.
+
+Priority screens, in this order:
+1. Login (staff Google OAuth flow)
+2. Orders queue — live-updating via the /ws/staff WebSocket connection,
+   shows PENDING_REVIEW and UNDER_REVIEW orders oldest first
+3. Order review screen — per item, show: qty requested, the NAV stock
+   snapshot with a clear "as of HH:MM — unverified, confirm physically"
+   label, and buttons for Available / Partial (with qty input) /
+   Unavailable
+4. Order detail/lifecycle screen — advance status through
+   PREPARING/READY/PICKED/DELIVERED, cancel with reason
+5. Catalog browse (read-only, no create/edit/delete anywhere in this UI —
+   if you're tempted to add an edit button because it seems useful, don't,
+   ask me first)
+
+Structure: src/features/{auth,orders,catalog,staff}, src/shared/{components,
+hooks,lib}. Put the WebSocket connection logic in a shared hook
+(useWebSocket) used by the orders queue screen.
+
+Use whatever component patterns are idiomatic for this stack — I'm not
+attached to a specific component library beyond Tailwind for styling.
+
+Phase 8 — Flutter customer app
+Read PROJECT_CONTEXT.md.
+
+Scaffold the Flutter customer app.
+
+Priority screens, in this order:
+1. Google Sign-In flow
+2. Catalog browse + search
+3. Cart
+4. Order placement + order tracking screen (shows current status)
+5. Shortage decision screen — this is the important one: when an order
+   is AWAITING_CUSTOMER_DECISION, show available items and unavailable
+   items clearly separated, both possible totals, and two buttons:
+   "Proceed with available items" / "Cancel entire order"
+6. Notifications list
+
+Structure: lib/core/{network,websocket,constants}, lib/features/{auth,
+catalog,cart,orders,notifications}, lib/l10n for EN/AM.
+
+State management: your choice of Riverpod or Bloc — pick one and be
+consistent throughout, don't mix patterns across features.
+
+Connect to /ws/customer on app launch (after login) to receive live order
+status pushes; also implement pull-to-refresh as a fallback for when the
+socket isn't connected.
